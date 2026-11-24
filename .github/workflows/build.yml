@@ -48,8 +48,8 @@ jobs:
                   applicationId = "com.example.notifhistory"
                   minSdk = 26
                   targetSdk = 34
-                  versionCode = 1
-                  versionName = "1.0"
+                  versionCode = 2
+                  versionName = "1.1"
               }
               compileOptions {
                   sourceCompatibility = JavaVersion.VERSION_17
@@ -61,6 +61,7 @@ jobs:
           cat > app/src/main/AndroidManifest.xml <<'EOF'
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
               <application
                   android:label="История уведомлений"
                   android:theme="@android:style/Theme.Material.Light.NoActionBar">
@@ -91,6 +92,7 @@ jobs:
           import android.content.Context
           import android.database.sqlite.SQLiteDatabase
           import android.database.sqlite.SQLiteOpenHelper
+          import java.io.File
 
           data class Item(
               val id: Long,
@@ -98,27 +100,42 @@ jobs:
               val app: String,
               val title: String,
               val text: String,
-              val time: Long
+              val time: Long,
+              val kind: String,
+              val path: String
           )
 
-          class Db(ctx: Context) : SQLiteOpenHelper(ctx.applicationContext, "notif.db", null, 1) {
+          class Db(ctx: Context) : SQLiteOpenHelper(ctx.applicationContext, "notif.db", null, 2) {
+
+              private val appCtx: Context = ctx.applicationContext
 
               override fun onCreate(db: SQLiteDatabase) {
                   db.execSQL(
                       "CREATE TABLE n(id INTEGER PRIMARY KEY AUTOINCREMENT, " +
-                      "pkg TEXT, app TEXT, title TEXT, text TEXT, time INTEGER)"
+                      "pkg TEXT, app TEXT, title TEXT, text TEXT, time INTEGER, " +
+                      "kind TEXT, path TEXT)"
                   )
               }
 
-              override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {}
+              override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
+                  if (oldVersion < 2) {
+                      db.execSQL("ALTER TABLE n ADD COLUMN kind TEXT")
+                      db.execSQL("ALTER TABLE n ADD COLUMN path TEXT")
+                  }
+              }
 
-              fun add(pkg: String, app: String, title: String, text: String, time: Long) {
-                  // не сохраняем подряд идущие одинаковые уведомления одного приложения
-                  readableDatabase.rawQuery(
-                      "SELECT title, text FROM n WHERE pkg = ? ORDER BY id DESC LIMIT 1",
-                      arrayOf(pkg)
-                  ).use { c ->
-                      if (c.moveToFirst() && c.getString(0) == title && c.getString(1) == text) return
+              fun add(
+                  pkg: String, app: String, title: String, text: String,
+                  time: Long, kind: String, path: String
+              ) {
+                  if (path.isEmpty()) {
+                      // не сохраняем подряд идущие одинаковые уведомления одного приложения
+                      readableDatabase.rawQuery(
+                          "SELECT title, text FROM n WHERE pkg = ? ORDER BY id DESC LIMIT 1",
+                          arrayOf(pkg)
+                      ).use { c ->
+                          if (c.moveToFirst() && c.getString(0) == title && c.getString(1) == text) return
+                      }
                   }
                   val v = ContentValues()
                   v.put("pkg", pkg)
@@ -126,6 +143,8 @@ jobs:
                   v.put("title", title)
                   v.put("text", text)
                   v.put("time", time)
+                  v.put("kind", kind)
+                  v.put("path", path)
                   writableDatabase.insert("n", null, v)
               }
 
@@ -133,14 +152,24 @@ jobs:
                   val out = ArrayList<Item>()
                   val like = "%" + q + "%"
                   readableDatabase.rawQuery(
-                      "SELECT id, pkg, app, title, text, time FROM n " +
+                      "SELECT id, pkg, app, title, text, time, kind, path FROM n " +
                       "WHERE app LIKE ? OR title LIKE ? OR text LIKE ? " +
                       "ORDER BY time DESC LIMIT 2000",
                       arrayOf(like, like, like)
                   ).use { c ->
                       while (c.moveToNext()) {
-                          out.add(Item(c.getLong(0), c.getString(1), c.getString(2),
-                              c.getString(3), c.getString(4), c.getLong(5)))
+                          out.add(
+                              Item(
+                                  c.getLong(0),
+                                  c.getString(1) ?: "",
+                                  c.getString(2) ?: "",
+                                  c.getString(3) ?: "",
+                                  c.getString(4) ?: "",
+                                  c.getLong(5),
+                                  c.getString(6) ?: "",
+                                  c.getString(7) ?: ""
+                              )
+                          )
                       }
                   }
                   return out
@@ -148,6 +177,60 @@ jobs:
 
               fun clear() {
                   writableDatabase.delete("n", null, null)
+                  File(appCtx.filesDir, "images").deleteRecursively()
+                  File(appCtx.filesDir, "voice").deleteRecursively()
+              }
+          }
+          EOF
+          cat > app/src/main/java/com/example/notifhistory/Voice.kt <<'EOF'
+          package com.example.notifhistory
+
+          import android.content.Context
+          import android.os.Build
+          import android.os.Environment
+          import java.io.File
+
+          object Voice {
+
+              private val roots = listOf(
+                  "Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Voice Notes",
+                  "Android/media/com.whatsapp.w4b/WhatsApp Business/Media/WhatsApp Business Voice Notes",
+                  "WhatsApp/Media/WhatsApp Voice Notes"
+              )
+
+              @Synchronized
+              fun scan(ctx: Context) {
+                  try {
+                      if (Build.VERSION.SDK_INT >= 30 && !Environment.isExternalStorageManager()) return
+                      val prefs = ctx.getSharedPreferences("voice", Context.MODE_PRIVATE)
+                      val first = !prefs.contains("seen")
+                      val seen = HashSet<String>(prefs.getStringSet("seen", emptySet()) ?: emptySet())
+                      val base = Environment.getExternalStorageDirectory()
+                      val dir = File(ctx.filesDir, "voice")
+                      dir.mkdirs()
+                      val db = Db(ctx)
+                      for (r in roots) {
+                          val root = File(base, r)
+                          if (!root.exists()) continue
+                          for (f in root.walkTopDown()) {
+                              if (!f.isFile) continue
+                              val key = f.absolutePath
+                              if (seen.contains(key)) continue
+                              seen.add(key)
+                              // при первом запуске старые записи только помечаем, не копируем
+                              if (first) continue
+                              val out = File(dir, f.lastModified().toString() + "_" + f.name)
+                              f.copyTo(out, true)
+                              db.add(
+                                  "com.whatsapp", "WhatsApp", "Голосовое сообщение",
+                                  "(нажмите, чтобы прослушать)",
+                                  System.currentTimeMillis(), "voice", out.absolutePath
+                              )
+                          }
+                      }
+                      prefs.edit().putStringSet("seen", seen).apply()
+                  } catch (e: Exception) {
+                  }
               }
           }
           EOF
@@ -155,22 +238,43 @@ jobs:
           package com.example.notifhistory
 
           import android.app.Notification
+          import android.graphics.Bitmap
+          import android.graphics.Canvas
+          import android.graphics.drawable.Drawable
+          import android.graphics.drawable.Icon
+          import android.os.Build
           import android.service.notification.NotificationListenerService
           import android.service.notification.StatusBarNotification
+          import java.io.File
+          import java.io.FileOutputStream
 
           class NotifService : NotificationListenerService() {
 
               private val db by lazy { Db(this) }
+              private var lastImgKey = ""
 
               override fun onNotificationPosted(sbn: StatusBarNotification) {
                   try {
+                      if (sbn.packageName.startsWith("com.whatsapp")) {
+                          val ctx = applicationContext
+                          Thread {
+                              try {
+                                  Thread.sleep(5000)
+                                  Voice.scan(ctx)
+                                  Thread.sleep(25000)
+                                  Voice.scan(ctx)
+                              } catch (e: Exception) {
+                              }
+                          }.start()
+                      }
                       val n = sbn.notification
                       if (n.flags and Notification.FLAG_GROUP_SUMMARY != 0) return
                       val e = n.extras
                       val title = e.getCharSequence(Notification.EXTRA_TITLE)?.toString() ?: ""
                       val text = (e.getCharSequence(Notification.EXTRA_BIG_TEXT)
                           ?: e.getCharSequence(Notification.EXTRA_TEXT))?.toString() ?: ""
-                      if (title.isEmpty() && text.isEmpty()) return
+                      val img = saveImage(n, sbn.packageName + "|" + title + "|" + text + "|")
+                      if (title.isEmpty() && text.isEmpty() && img.isEmpty()) return
                       val app = try {
                           packageManager.getApplicationLabel(
                               packageManager.getApplicationInfo(sbn.packageName, 0)
@@ -178,9 +282,49 @@ jobs:
                       } catch (ex: Exception) {
                           sbn.packageName
                       }
-                      db.add(sbn.packageName, app, title, text, sbn.postTime)
+                      db.add(
+                          sbn.packageName, app, title, text, sbn.postTime,
+                          if (img.isEmpty()) "" else "image", img
+                      )
                   } catch (ex: Exception) {
                   }
+              }
+
+              private fun saveImage(n: Notification, keyPrefix: String): String {
+                  try {
+                      val e = n.extras
+                      var bmp: Bitmap? = null
+                      val p = e.get(Notification.EXTRA_PICTURE)
+                      if (p is Bitmap) bmp = p
+                      if (bmp == null && Build.VERSION.SDK_INT >= 31) {
+                          val ic = e.get(Notification.EXTRA_PICTURE_ICON)
+                          if (ic is Icon) {
+                              val d = ic.loadDrawable(this)
+                              if (d != null) bmp = toBitmap(d)
+                          }
+                      }
+                      if (bmp == null) return ""
+                      val key = keyPrefix + bmp.width + "x" + bmp.height
+                      if (key == lastImgKey) return ""
+                      lastImgKey = key
+                      val dir = File(filesDir, "images")
+                      dir.mkdirs()
+                      val f = File(dir, System.currentTimeMillis().toString() + ".jpg")
+                      FileOutputStream(f).use { bmp.compress(Bitmap.CompressFormat.JPEG, 90, it) }
+                      return f.absolutePath
+                  } catch (ex: Exception) {
+                      return ""
+                  }
+              }
+
+              private fun toBitmap(d: Drawable): Bitmap {
+                  val w = if (d.intrinsicWidth > 0) d.intrinsicWidth else 512
+                  val h = if (d.intrinsicHeight > 0) d.intrinsicHeight else 512
+                  val b = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                  val c = Canvas(b)
+                  d.setBounds(0, 0, w, h)
+                  d.draw(c)
+                  return b
               }
           }
           EOF
@@ -190,7 +334,12 @@ jobs:
           import android.app.Activity
           import android.app.AlertDialog
           import android.content.Intent
+          import android.graphics.BitmapFactory
+          import android.media.MediaPlayer
+          import android.net.Uri
+          import android.os.Build
           import android.os.Bundle
+          import android.os.Environment
           import android.provider.Settings
           import android.text.Editable
           import android.text.TextWatcher
@@ -198,9 +347,11 @@ jobs:
           import android.widget.ArrayAdapter
           import android.widget.Button
           import android.widget.EditText
+          import android.widget.ImageView
           import android.widget.LinearLayout
           import android.widget.ListView
           import android.widget.TextView
+          import android.widget.Toast
           import java.text.SimpleDateFormat
           import java.util.Date
           import java.util.Locale
@@ -210,8 +361,11 @@ jobs:
               private lateinit var db: Db
               private lateinit var list: ListView
               private lateinit var access: Button
+              private lateinit var files: Button
               private lateinit var count: TextView
               private var query = ""
+              private var current: List<Item> = emptyList()
+              private var player: MediaPlayer? = null
               private val fmt = SimpleDateFormat("dd.MM.yyyy HH:mm", Locale.getDefault())
 
               override fun onCreate(savedInstanceState: Bundle?) {
@@ -228,6 +382,19 @@ jobs:
                       startActivity(Intent("android.settings.ACTION_NOTIFICATION_LISTENER_SETTINGS"))
                   }
                   root.addView(access)
+
+                  files = Button(this)
+                  files.text = "Разрешить доступ к файлам (для голосовых WhatsApp)"
+                  files.setOnClickListener {
+                      try {
+                          val i = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
+                          i.data = Uri.parse("package:" + packageName)
+                          startActivity(i)
+                      } catch (e: Exception) {
+                          startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+                      }
+                  }
+                  root.addView(files)
 
                   val search = EditText(this)
                   search.hint = "Поиск по приложению, заголовку, тексту"
@@ -246,6 +413,9 @@ jobs:
                   root.addView(count)
 
                   list = ListView(this)
+                  list.setOnItemClickListener { _, _, pos, _ ->
+                      if (pos < current.size) open(current[pos])
+                  }
                   root.addView(
                       list,
                       LinearLayout.LayoutParams(
@@ -257,7 +427,7 @@ jobs:
                   clear.text = "Очистить историю"
                   clear.setOnClickListener {
                       AlertDialog.Builder(this)
-                          .setMessage("Удалить всю историю уведомлений?")
+                          .setMessage("Удалить всю историю, фото и голосовые?")
                           .setPositiveButton("Удалить") { _, _ ->
                               db.clear()
                               refresh()
@@ -273,6 +443,17 @@ jobs:
               override fun onResume() {
                   super.onResume()
                   refresh()
+                  val ctx = applicationContext
+                  Thread {
+                      Voice.scan(ctx)
+                      runOnUiThread { refresh() }
+                  }.start()
+              }
+
+              override fun onDestroy() {
+                  super.onDestroy()
+                  player?.release()
+                  player = null
               }
 
               private fun hasAccess(): Boolean {
@@ -280,23 +461,15 @@ jobs:
                   return s != null && s.contains(packageName)
               }
 
-              private fun refresh() {
-                  access.visibility = if (hasAccess()) View.GONE else View.VISIBLE
-                  val items = db.list(query)
-                  count.text = "Записей: " + items.size
-                  val rows = items.map {
-                      it.app + "  •  " + fmt.format(Date(it.time)) + "\n" +
-                          (if (it.title.isNotEmpty()) it.title + "\n" else "") + it.text
-                  }
-                  list.adapter = ArrayAdapter(this, android.R.layout.simple_list_item_1, rows)
+              private fun needsFiles(): Boolean {
+                  return Build.VERSION.SDK_INT >= 30 && !Environment.isExternalStorageManager()
               }
-          }
-          EOF
-      - name: Build APK
-        run: gradle assembleDebug --no-daemon
-      - name: Publish release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: v${{ github.run_number }}
-          name: Notif History v${{ github.run_number }}
-          files: app/build/outputs/apk/debug/app-debug.apk
+
+              private fun open(it: Item) {
+                  if (it.path.isEmpty()) return
+                  if (it.kind == "voice") {
+                      try {
+                          player?.release()
+                          player = null
+                          val p = MediaPlayer()
+            
