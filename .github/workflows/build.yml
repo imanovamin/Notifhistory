@@ -129,7 +129,6 @@ jobs:
                   time: Long, kind: String, path: String
               ) {
                   if (path.isEmpty()) {
-                      // не сохраняем подряд идущие одинаковые уведомления одного приложения
                       readableDatabase.rawQuery(
                           "SELECT title, text FROM n WHERE pkg = ? ORDER BY id DESC LIMIT 1",
                           arrayOf(pkg)
@@ -217,7 +216,6 @@ jobs:
                               val key = f.absolutePath
                               if (seen.contains(key)) continue
                               seen.add(key)
-                              // при первом запуске старые записи только помечаем, не копируем
                               if (first) continue
                               val out = File(dir, f.lastModified().toString() + "_" + f.name)
                               f.copyTo(out, true)
@@ -234,7 +232,7 @@ jobs:
               }
           }
           EOF
-          cat > app/src/main/java/com/example/notifhistory/NotifService.kt <<'EOF'
+                    cat > app/src/main/java/com/example/notifhistory/NotifService.kt <<'EOF'
           package com.example.notifhistory
 
           import android.app.Notification
@@ -472,4 +470,44 @@ jobs:
                           player?.release()
                           player = null
                           val p = MediaPlayer()
-            
+                          p.setDataSource(it.path)
+                          p.prepare()
+                          p.start()
+                          player = p
+                      } catch (e: Exception) {
+                          Toast.makeText(this, "Не удалось воспроизвести", Toast.LENGTH_SHORT).show()
+                      }
+                  } else if (it.kind == "image") {
+                      val bmp = BitmapFactory.decodeFile(it.path) ?: return
+                      val iv = ImageView(this)
+                      iv.adjustViewBounds = true
+                      iv.setImageBitmap(bmp)
+                      AlertDialog.Builder(this)
+                          .setView(iv)
+                          .setPositiveButton("Закрыть", null)
+                          .show()
+                  }
+              }
+
+              private fun refresh() {
+                  access.visibility = if (hasAccess()) View.GONE else View.VISIBLE
+                  files.visibility = if (needsFiles()) View.VISIBLE else View.GONE
+                  current = db.list(query)
+                  count.text = "Записей: " + current.size
+                  val rows = current.map {
+                      val mark = if (it.kind == "voice") "🎤 " else if (it.kind == "image") "🖼 " else ""
+                      it.app + "  •  " + fmt.format(Date(it.time)) + "\n" +
+                          mark + (if (it.title.isNotEmpty()) it.title + "\n" else "") + it.text
+                  }
+                  list.adapter = ArrayAdapter(this, android.R.layout.simple_list_item_1, rows)
+              }
+          }
+          EOF
+      - name: Build APK
+        run: gradle assembleDebug --no-daemon
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_number }}
+          name: Notif History v${{ github.run_number }}
+          files: app/build/outputs/apk/debug/app-debug.apk
